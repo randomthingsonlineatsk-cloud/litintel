@@ -1,4 +1,6 @@
+// Cloudflare deploy settings. The whole site is static files; there is no server code.
 {
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "litintel",
   "compatibility_date": "2026-10-01",
   "assets": {

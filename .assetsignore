@@ -1,3 +1,4 @@
+# Files Cloudflare must NOT publish. Only the website itself goes online.
 node_modules
 .git
 .github

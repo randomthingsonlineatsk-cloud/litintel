@@ -1,13 +1,13 @@
 {
   "name": "litintel",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Search, screen, extract and verify scientific literature with every decision traceable to its source.",
   "main": "core.js",
   "directories": {
     "test": "test"
   },
   "scripts": {
-    "test": "node test/core.test.js && node test/import.test.js && node test/watch.test.mjs",
+    "test": "node test/core.test.js && node test/import.test.js && node test/adapters.test.js && node test/watch.test.mjs",
     "watch": "node watch/run.mjs"
   },
   "author": "Khan Gulrez Shagufa Fazal Ahmed",

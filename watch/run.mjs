@@ -38,6 +38,16 @@ export async function main({ fetchFn = globalThis.fetch, root = ROOT, now = new 
   const cfgPath = path.join(root, 'watch', 'searches.json');
   const statePath = path.join(root, 'watch', 'state.json');
   const cfg = JSON.parse(await readFile(cfgPath, 'utf8'));
+  // Searches can come from a GitHub secret (private) or from the file. With none, the watch does nothing.
+  if (process.env.LITINTEL_SEARCHES) {
+    try { Object.assign(cfg, JSON.parse(process.env.LITINTEL_SEARCHES)); }
+    catch (e) { console.error('LITINTEL_SEARCHES secret is not valid JSON: ' + e.message); process.exitCode = 1; return null; }
+  }
+  if (!(cfg.searches || []).length) {
+    console.log('No searches configured; the weekly watch is switched off. Nothing was searched or written.');
+    if (process.env.GITHUB_OUTPUT) await writeFile(process.env.GITHUB_OUTPUT, 'new_count=0\nreport=\n', { flag: 'a' });
+    return { newCount: 0, skipped: true };
+  }
   const state = existsSync(statePath) ? JSON.parse(await readFile(statePath, 'utf8')) : { lastRun: null, seen: [] };
   const fallback = new Date(now.getTime() - 7 * 864e5).toISOString().slice(0, 10);
   const since = state.lastRun ? state.lastRun.slice(0, 10) : fallback;
@@ -46,8 +56,10 @@ export async function main({ fetchFn = globalThis.fetch, root = ROOT, now = new 
   const runs = []; let all = [];
   for (const s of cfg.searches || []) {
     try {
+      if (s.source !== 'pubmed' && !C.ADAPTERS[s.source]) throw new Error('unknown source "' + s.source + '"');
       const res = s.source === 'pubmed' ? await pubmedSince(s.query, since, opts, fetchFn)
-        : await C.searchEuropePMC({ query: s.query, since, max: 500, fetch: fetchFn });
+        : await C.ADAPTERS[s.source]({ query: s.query, since, max: 500, fetch: fetchFn, email: opts.email,
+          apiKey: s.source === 'openalex' ? process.env.OPENALEX_API_KEY : s.source === 'semanticscholar' ? process.env.S2_API_KEY : undefined });
       runs.push({ source: res.source, query: s.query, total: res.total, retrieved: res.records.length });
       all = all.concat(res.records);
     } catch (e) {

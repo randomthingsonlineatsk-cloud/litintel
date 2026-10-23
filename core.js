@@ -8,7 +8,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.3.0';
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---------------------------------------------------------------- text utils
@@ -85,6 +85,7 @@
       pmid: o.pmid ? String(o.pmid).replace(/\D/g, '') : '',
       pmcid: o.pmcid || '',
       openalexId: o.openalexId || '',
+      registryId: o.registryId ? String(o.registryId).toUpperCase() : '',
       abstract: stripTags(o.abstract || ''),
       pubTypes: (o.pubTypes || []).filter(Boolean),
       keywords: (o.keywords || []).filter(Boolean),
@@ -100,11 +101,13 @@
   function recordKey(r) {
     if (r.doi) return 'doi:' + r.doi;
     if (r.pmid) return 'pmid:' + r.pmid;
+    if (r.registryId) return 'reg:' + r.registryId;
     return 'title:' + normTitle(r.title).slice(0, 120) + '|' + (r.year || '');
   }
   function recordUrl(r) {
     if (r.doi) return 'https://doi.org/' + r.doi;
     if (r.pmid) return 'https://pubmed.ncbi.nlm.nih.gov/' + r.pmid + '/';
+    if (/^NCT\d{8}$/.test(r.registryId)) return 'https://clinicaltrials.gov/study/' + r.registryId;
     const any = Object.values(r.sourceUrls || {})[0];
     return any || '';
   }
@@ -189,7 +192,7 @@
   /** Europe PMC REST API. opts: {query, max, yearFrom, yearTo, since, fetch} */
   async function searchEuropePMC(opts) {
     const f = opts.fetch || root.fetch.bind(root);
-    let query = '(' + opts.query + ')';
+    let query = '(' + stripFieldTags(opts.query) + ')';
     if (opts.since) query += ' AND FIRST_IDATE:[' + opts.since + ' TO 3000-12-31]';
     else if (opts.yearFrom || opts.yearTo) query += ' AND PUB_YEAR:[' + (opts.yearFrom || 1800) + ' TO ' + (opts.yearTo || 3000) + ']';
     const max = Math.min(opts.max || 100, 2000);
@@ -242,7 +245,7 @@
     const records = [];
     while (records.length < max) {
       const per = Math.min(200, max - records.length);
-      const url = 'https://api.openalex.org/works?search=' + encodeURIComponent(opts.query) + '&per_page=' + per +
+      const url = 'https://api.openalex.org/works?search=' + encodeURIComponent(stripFieldTags(opts.query)) + '&per_page=' + per +
         '&cursor=' + encodeURIComponent(cursor) + (filters.length ? '&filter=' + filters.join(',') : '') +
         (opts.apiKey ? '&api_key=' + encodeURIComponent(opts.apiKey) : '');
       if (!firstUrl) firstUrl = url.replace(/&api_key=[^&]+/, '&api_key=…');
@@ -279,23 +282,203 @@
     });
   }
 
-  const ADAPTERS = { pubmed: searchPubMed, europepmc: searchEuropePMC, openalex: searchOpenAlex };
+
+  // ---------------------------------------------------------------- query translation
+  /** Remove PubMed-only field tags such as [tiab], [mh], [MeSH Terms]. */
+  function stripFieldTags(q) { return String(q || '').replace(/\[[A-Za-z :]+\]/g, '').replace(/\s+/g, ' ').trim(); }
+  /** Plain keywords for services without Boolean search (Crossref). NOT terms are dropped. */
+  function toPlainQuery(q) {
+    return stripFieldTags(q).replace(/\bNOT\s+(\([^)]*\)|"[^"]*"|\S+)/g, ' ').replace(/\b(AND|OR)\b/g, ' ')
+      .replace(/[()"*]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  /** Semantic Scholar bulk syntax: + AND, | OR, - NOT, "phrase", prefix*. */
+  function toS2Query(q) {
+    return stripFieldTags(q).replace(/\bNOT\s+/g, ' -').replace(/\bAND\b/g, ' + ').replace(/\bOR\b/g, ' | ').replace(/\s+/g, ' ').trim();
+  }
+  /** DOAJ (Elasticsearch query string, wildcards disabled). */
+  function toDoajQuery(q) { return stripFieldTags(q).replace(/\*/g, '').replace(/\s+/g, ' ').trim(); }
+
+  // ---------------------------------------------------------------- Crossref
+  /** Crossref works search. Free, no key. No Boolean operators: words are matched by relevance. */
+  async function searchCrossref(opts) {
+    const f = opts.fetch || root.fetch.bind(root);
+    const filters = [];
+    if (opts.since) filters.push('from-index-date:' + opts.since);
+    else { if (opts.yearFrom) filters.push('from-pub-date:' + opts.yearFrom); if (opts.yearTo) filters.push('until-pub-date:' + opts.yearTo + '-12-31'); }
+    const max = Math.min(opts.max || 100, 2000);
+    const query = toPlainQuery(opts.query);
+    let cursor = '*', total = 0, firstUrl = ''; const records = [];
+    while (records.length < max) {
+      const rows = Math.min(500, max - records.length);
+      const url = 'https://api.crossref.org/works?query=' + encodeURIComponent(query) + '&rows=' + rows + '&cursor=' + encodeURIComponent(cursor) +
+        (filters.length ? '&filter=' + filters.join(',') : '') + (opts.email ? '&mailto=' + encodeURIComponent(opts.email) : '') +
+        '&select=DOI,title,author,issued,container-title,volume,issue,page,abstract,type,subject,language,URL,update-to';
+      if (!firstUrl) firstUrl = url;
+      const js = await getJson(f, url);
+      const m = js.message || {};
+      total = Number(m['total-results'] || 0);
+      const items = m.items || [];
+      items.forEach((w) => records.push(fromCrossref(w)));
+      if (!items.length || records.length >= total || !m['next-cursor']) break;
+      cursor = m['next-cursor'];
+      await sleep(200);
+    }
+    return { source: 'Crossref', total, retrieved: records.length, url: firstUrl, records };
+  }
+  function fromCrossref(w) {
+    const dp = (w.issued && w.issued['date-parts'] && w.issued['date-parts'][0]) || [];
+    const type = String(w.type || '').replace(/-/g, ' ');
+    return makeRecord({
+      title: (w.title || [])[0] || '', authors: (w.author || []).map((a) => a.family ? a.family + (a.given ? ' ' + a.given : '') : a.name),
+      year: dp[0] || null, journal: (w['container-title'] || [])[0] || '', volume: w.volume, issue: w.issue, pages: w.page,
+      doi: w.DOI, abstract: String(w.abstract || '').replace(/<jats:title>[^<]*<\/jats:title>/g, ' '), pubTypes: type ? [type] : [],
+      keywords: w.subject || [], language: w.language || '',
+      retracted: (w['update-to'] || []).some((u) => /retract/i.test(u.type || '')) ? true : null,
+      sources: ['Crossref'], sourceUrls: { Crossref: w.URL || '' },
+    });
+  }
+
+  // ---------------------------------------------------------------- Semantic Scholar
+  /** Semantic Scholar bulk paper search. Free; an optional free key gives a dedicated rate limit. */
+  async function searchSemanticScholar(opts) {
+    const f = opts.fetch || root.fetch.bind(root);
+    const max = Math.min(opts.max || 100, 2000);
+    const fields = 'title,abstract,year,venue,authors,externalIds,publicationTypes,isOpenAccess,publicationDate,journal,fieldsOfStudy';
+    let date = '';
+    if (opts.since) date = '&publicationDateOrYear=' + opts.since + ':';
+    else if (opts.yearFrom || opts.yearTo) date = '&year=' + (opts.yearFrom || '') + '-' + (opts.yearTo || '');
+    const headers = opts.apiKey ? { 'x-api-key': opts.apiKey } : undefined;
+    let token = null, total = 0, firstUrl = ''; const records = [];
+    do {
+      const url = 'https://api.semanticscholar.org/graph/v1/paper/search/bulk?query=' + encodeURIComponent(toS2Query(opts.query)) +
+        '&fields=' + fields + date + (token ? '&token=' + encodeURIComponent(token) : '');
+      if (!firstUrl) firstUrl = url;
+      const res = await f(url, headers ? { headers } : undefined);
+      if (!res.ok) throw new Error('HTTP ' + res.status + ' from ' + url.split('?')[0]);
+      const js = await res.json();
+      total = Number(js.total || 0);
+      (js.data || []).forEach((p) => { if (records.length < max) records.push(fromSemanticScholar(p)); });
+      token = js.token || null;
+      if (token && records.length < max) await sleep(opts.apiKey ? 1100 : 1500);
+    } while (token && records.length < max);
+    return { source: 'Semantic Scholar', total, retrieved: records.length, url: firstUrl, records };
+  }
+  function fromSemanticScholar(p) {
+    const ids = p.externalIds || {}; const j = p.journal || {};
+    return makeRecord({
+      title: p.title, authors: (p.authors || []).map((a) => a.name), year: p.year, date: p.publicationDate || null,
+      journal: j.name || p.venue || '', volume: j.volume || '', pages: String(j.pages || '').replace(/\s/g, ''),
+      doi: ids.DOI, pmid: ids.PubMed, pmcid: ids.PubMedCentral ? 'PMC' + String(ids.PubMedCentral).replace(/^PMC/i, '') : '',
+      abstract: p.abstract || '', pubTypes: p.publicationTypes || [], keywords: p.fieldsOfStudy || [], isOA: p.isOpenAccess,
+      sources: ['Semantic Scholar'], sourceUrls: { 'Semantic Scholar': p.paperId ? 'https://www.semanticscholar.org/paper/' + p.paperId : '' },
+    });
+  }
+
+  // ---------------------------------------------------------------- ClinicalTrials.gov
+  /** ClinicalTrials.gov API v2. Free, no key. Returns trial registrations, not papers. */
+  async function searchClinicalTrials(opts) {
+    const f = opts.fetch || root.fetch.bind(root);
+    const max = Math.min(opts.max || 100, 2000);
+    let adv = '';
+    if (opts.since) adv = 'AREA[StudyFirstPostDate]RANGE[' + opts.since + ',MAX]';
+    else if (opts.yearFrom || opts.yearTo) adv = 'AREA[StartDate]RANGE[' + (opts.yearFrom ? opts.yearFrom + '-01-01' : 'MIN') + ',' + (opts.yearTo ? opts.yearTo + '-12-31' : 'MAX') + ']';
+    let token = null, total = 0, firstUrl = ''; const records = [];
+    do {
+      const url = 'https://clinicaltrials.gov/api/v2/studies?format=json&countTotal=true&pageSize=' + Math.min(200, max - records.length) +
+        '&query.term=' + encodeURIComponent(stripFieldTags(opts.query)) + (adv ? '&filter.advanced=' + encodeURIComponent(adv) : '') +
+        (token ? '&pageToken=' + encodeURIComponent(token) : '');
+      if (!firstUrl) firstUrl = url;
+      const js = await getJson(f, url);
+      if (js.totalCount != null) total = Number(js.totalCount);
+      (js.studies || []).forEach((st) => records.push(fromClinicalTrial(st)));
+      token = js.nextPageToken || null;
+      if (token) await sleep(1300); // about 50 requests per minute
+    } while (token && records.length < max);
+    return { source: 'ClinicalTrials.gov', total: total || records.length, retrieved: records.length, url: firstUrl, records };
+  }
+  function fromClinicalTrial(st) {
+    const ps = st.protocolSection || {};
+    const id = ps.identificationModule || {}, sm = ps.statusModule || {}, dm = ps.designModule || {}, de = ps.descriptionModule || {};
+    const cm = ps.conditionsModule || {}, am = ps.armsInterventionsModule || {}, sp = ps.sponsorCollaboratorsModule || {};
+    const phases = (dm.phases || []).filter((x) => x && x !== 'NA').map((x) => x.replace('PHASE', 'Phase ').replace('EARLY_Phase ', 'Early phase '));
+    const studyType = dm.studyType === 'INTERVENTIONAL' ? 'Interventional' : dm.studyType === 'OBSERVATIONAL' ? 'Observational' : (dm.studyType || '');
+    const design = dm.designInfo || {};
+    const randomised = /RANDOMIZED/.test(design.allocation || '') && !/NON_RANDOMIZED/.test(design.allocation || '');
+    const interventions = (am.interventions || []).map((i) => (i.type ? i.type.charAt(0) + i.type.slice(1).toLowerCase().replace(/_/g, ' ') + ': ' : '') + i.name);
+    const n = dm.enrollmentInfo && dm.enrollmentInfo.count;
+    const start = (sm.startDateStruct && sm.startDateStruct.date) || '';
+    const posted = (sm.studyFirstPostDateStruct && sm.studyFirstPostDateStruct.date) || '';
+    // a readable summary in abstract form, so screening and extraction work the same way as for papers
+    const parts = [];
+    parts.push('REGISTRY RECORD: ' + [studyType && studyType + ' study', randomised && 'randomized', phases.join('/'), sm.overallStatus && 'status ' + sm.overallStatus.toLowerCase().replace(/_/g, ' ')].filter(Boolean).join(', ') + '.');
+    if (cm.conditions && cm.conditions.length) parts.push('Conditions: ' + cm.conditions.join('; ') + '.');
+    if (interventions.length) parts.push('Interventions: ' + interventions.join('; ') + '.');
+    if (n) parts.push('Enrollment: ' + n + ' participants' + (dm.enrollmentInfo.type ? ' (' + dm.enrollmentInfo.type.toLowerCase() + ')' : '') + '.');
+    if (de.briefSummary) parts.push('SUMMARY: ' + de.briefSummary);
+    if (sp.leadSponsor && sp.leadSponsor.name) parts.push('Sponsor: ' + sp.leadSponsor.name + '.');
+    const types = ['Clinical trial registration', studyType, randomised ? 'Randomized' : ''].concat(phases).filter(Boolean);
+    return makeRecord({
+      title: id.officialTitle || id.briefTitle, authors: sp.leadSponsor && sp.leadSponsor.name ? [sp.leadSponsor.name] : [],
+      year: (start || posted).slice(0, 4) || null, date: posted || null, journal: 'ClinicalTrials.gov', registryId: id.nctId,
+      abstract: parts.join(' '), pubTypes: types, keywords: (cm.conditions || []).concat(cm.keywords || []),
+      sources: ['ClinicalTrials.gov'], sourceUrls: { 'ClinicalTrials.gov': id.nctId ? 'https://clinicaltrials.gov/study/' + id.nctId : '' },
+    });
+  }
+
+  // ---------------------------------------------------------------- DOAJ
+  /** Directory of Open Access Journals article search. Free, no key; about 2 requests a second. */
+  async function searchDOAJ(opts) {
+    const f = opts.fetch || root.fetch.bind(root);
+    const max = Math.min(opts.max || 100, 1000);
+    let q = toDoajQuery(opts.query);
+    if (opts.since) q = '(' + q + ') AND created_date:[' + opts.since + ' TO *]';
+    else if (opts.yearFrom || opts.yearTo) q = '(' + q + ') AND bibjson.year:[' + (opts.yearFrom || '*') + ' TO ' + (opts.yearTo || '*') + ']';
+    let page = 1, total = 0, firstUrl = ''; const records = [];
+    while (records.length < max) {
+      const size = Math.min(100, max - records.length);
+      const url = 'https://doaj.org/api/search/articles/' + encodeURIComponent(q) + '?page=' + page + '&pageSize=' + size;
+      if (!firstUrl) firstUrl = url;
+      const js = await getJson(f, url);
+      total = Number(js.total || 0);
+      const list = js.results || [];
+      list.forEach((a) => records.push(fromDOAJ(a)));
+      if (!list.length || records.length >= total || list.length < size) break;
+      page++; await sleep(600);
+    }
+    return { source: 'DOAJ', total, retrieved: records.length, url: firstUrl, records };
+  }
+  function fromDOAJ(a) {
+    const b = a.bibjson || {}; const j = b.journal || {};
+    const doi = ((b.identifier || []).find((i) => String(i.type).toLowerCase() === 'doi') || {}).id || '';
+    const link = ((b.link || []).find((l) => l.type === 'fulltext') || (b.link || [])[0] || {}).url || '';
+    return makeRecord({
+      title: b.title, authors: (b.author || []).map((x) => x.name), year: b.year, journal: j.title || '', volume: j.volume || '', issue: j.number || '',
+      pages: b.start_page ? b.start_page + (b.end_page ? '-' + b.end_page : '') : '', doi, abstract: b.abstract || '',
+      pubTypes: ['Journal Article'], keywords: b.keywords || [], language: (j.language || [])[0] || '', isOA: true,
+      sources: ['DOAJ'], sourceUrls: { DOAJ: a.id ? 'https://doaj.org/article/' + a.id : link },
+    });
+  }
+
+  const ADAPTERS = { pubmed: searchPubMed, europepmc: searchEuropePMC, openalex: searchOpenAlex,
+    crossref: searchCrossref, semanticscholar: searchSemanticScholar, clinicaltrials: searchClinicalTrials, doaj: searchDOAJ };
 
   // ---------------------------------------------------------------- deduplication
   /** Merge records that share a DOI, a PMID, or the same normalised title and year (±1). */
   function dedupe(records) {
     const kept = [], merges = [];
-    const byDoi = new Map(), byPmid = new Map(), byTitle = new Map();
+    const byDoi = new Map(), byPmid = new Map(), byReg = new Map(), byTitle = new Map();
     const tkey = (r) => normTitle(r.title).slice(0, 150);
     for (const r of records) {
       let hit = null, on = '';
       if (r.doi && byDoi.has(r.doi)) { hit = byDoi.get(r.doi); on = 'DOI'; }
       else if (r.pmid && byPmid.has(r.pmid)) { hit = byPmid.get(r.pmid); on = 'PMID'; }
+      else if (r.registryId && byReg.has(r.registryId)) { hit = byReg.get(r.registryId); on = 'trial registration'; }
       else if (tkey(r).length > 20 && byTitle.has(tkey(r))) {
         const cand = byTitle.get(tkey(r));
         if (!r.year || !cand.year || Math.abs(r.year - cand.year) <= 1) {
           // never merge two records that carry different DOIs
-          if (!(r.doi && cand.doi && r.doi !== cand.doi)) { hit = cand; on = 'title + year'; }
+          // nor a trial registration with a paper, nor two different registrations
+          if (!(r.doi && cand.doi && r.doi !== cand.doi) && !!r.registryId === !!cand.registryId && r.registryId === cand.registryId) { hit = cand; on = 'title + year'; }
         }
       }
       if (hit) {
@@ -308,13 +491,14 @@
       const target = hit || kept[kept.length - 1];
       if (target.doi) byDoi.set(target.doi, target);
       if (target.pmid) byPmid.set(target.pmid, target);
+      if (target.registryId) byReg.set(target.registryId, target);
       if (tkey(target).length > 20) byTitle.set(tkey(target), target);
     }
     kept.forEach((r) => { r.id = recordKey(r); });
     return { records: kept, duplicatesRemoved: records.length - kept.length, merges };
   }
   function mergeInto(a, b) {
-    ['doi', 'pmid', 'pmcid', 'openalexId', 'journal', 'volume', 'issue', 'pages', 'date', 'language', 'year'].forEach((k) => { if (!a[k] && b[k]) a[k] = b[k]; });
+    ['doi', 'pmid', 'pmcid', 'openalexId', 'registryId', 'journal', 'volume', 'issue', 'pages', 'date', 'language', 'year'].forEach((k) => { if (!a[k] && b[k]) a[k] = b[k]; });
     if ((b.abstract || '').length > (a.abstract || '').length) a.abstract = b.abstract;
     if (b.authors.length > a.authors.length) a.authors = b.authors.slice();
     a.pubTypes = Array.from(new Set(a.pubTypes.concat(b.pubTypes)));
@@ -414,7 +598,12 @@
     const pt = (record.pubTypes || []).join(' | ');
     const ptDesign = /meta-analysis/i.test(pt) ? 'Meta-analysis' : /systematic review/i.test(pt) ? 'Systematic review'
       : /randomized controlled trial/i.test(pt) ? 'Randomised controlled trial' : /case reports?/i.test(pt) ? 'Case report / series' : null;
-    if (ptDesign) pick('studyDesign', ptDesign, 'Publication type: ' + pt, 'publication type');
+    const isReg = /clinical trial registration/i.test(pt);
+    if (isReg) {
+      const ph = (record.pubTypes || []).filter((t) => /phase/i.test(t)).join('/');
+      const kind = /randomized/i.test(pt) ? 'Randomised controlled trial' : /interventional/i.test(pt) ? 'Non-randomised trial' : /observational/i.test(pt) ? 'Observational study' : 'Clinical study';
+      pick('studyDesign', kind + ' (registered' + (ph ? ', ' + ph : '') + ')', 'Registry record: ' + pt, 'trial registry fields');
+    } else if (ptDesign) pick('studyDesign', ptDesign, 'Publication type: ' + pt, 'publication type');
     else {
       let done = false;
       for (const [name, re] of DESIGNS) {
@@ -498,8 +687,8 @@
     const add = (check, status, detail) => checks.push({ check, status, detail });
     const cr = ctx.crossref;
 
-    if (record.doi || record.pmid) add('Has a persistent identifier', 'pass', [record.doi && 'DOI ' + record.doi, record.pmid && 'PMID ' + record.pmid].filter(Boolean).join(' · '));
-    else add('Has a persistent identifier', 'fail', 'No DOI or PMID; the record cannot be traced reliably');
+    if (record.doi || record.pmid || record.registryId) add('Has a persistent identifier', 'pass', [record.doi && 'DOI ' + record.doi, record.pmid && 'PMID ' + record.pmid, record.registryId && 'Registry ' + record.registryId].filter(Boolean).join(' · '));
+    else add('Has a persistent identifier', 'fail', 'No DOI, PMID or trial registration; the record cannot be traced reliably');
 
     if (!record.doi) add('DOI registered at Crossref', 'skip', 'No DOI');
     else if (ctx.crossrefSkip) add('DOI registered at Crossref', 'skip', ctx.crossrefSkip);
@@ -546,7 +735,8 @@
   }
 
   // ---------------------------------------------------------------- gap analysis
-  function gapAnalysis(records, extractions) {
+  function gapAnalysis(records, extractions, label) {
+    const L = label || 'included';
     const by = (fn) => { const m = {}; records.forEach((r) => { const k = fn(r); if (k != null) m[k] = (m[k] || 0) + 1; }); return m; };
     const design = by((r) => (extractions[r.id] && extractions[r.id].studyDesign && extractions[r.id].studyDesign.value) || 'Not determined');
     const year = by((r) => r.year || null);
@@ -557,15 +747,15 @@
     const n = records.length;
     if (n) {
       const strong = (design['Randomised controlled trial'] || 0) + (design['Systematic review'] || 0) + (design['Meta-analysis'] || 0);
-      if (strong === 0) notes.push('No randomised trials or systematic reviews among the included records. The evidence base may rely on weaker designs.');
+      if (strong === 0) notes.push('No randomised trials or systematic reviews among the ' + L + ' records. The evidence base may rely on weaker designs.');
       const reviewsOnly = (design['Narrative review'] || 0) + (design['Systematic review'] || 0) + (design['Meta-analysis'] || 0);
-      if (reviewsOnly / n > 0.5) notes.push('More than half the included records are reviews; primary studies may be scarce.');
+      if (reviewsOnly / n > 0.5) notes.push('More than half the ' + L + ' records are reviews; primary studies may be scarce.');
       const und = design['Not determined'] || 0;
       if (und / n > 0.3) notes.push(und + ' records have no study design detected; check them manually before drawing conclusions.');
       const years = Object.keys(year).map(Number).sort();
       if (years.length) {
         const recent = records.filter((r) => r.year && r.year >= new Date().getFullYear() - 3).length;
-        notes.push(recent + ' of ' + n + ' included records are from the last three years (range ' + years[0] + '–' + years[years.length - 1] + ').');
+        notes.push(recent + ' of ' + n + ' ' + L + ' records are from the last three years (range ' + years[0] + '–' + years[years.length - 1] + ').');
       }
       const rare = topKeywords.length ? Object.entries(kw).filter(([, c]) => c === 1).length : 0;
       if (rare) notes.push(rare + ' keywords appear in only one record; these may mark under-studied sub-topics worth a targeted search.');
@@ -596,7 +786,7 @@
       const d = decisions[r.id] || {}, e = extractions[r.id] || {}, v = verifications[r.id] || {};
       const row = {
         'Record ID': r.id, 'Title': r.title, 'Authors': r.authors.slice(0, 6).join('; ') + (r.authors.length > 6 ? '; et al.' : ''),
-        'Year': r.year || '', 'Journal': r.journal, 'DOI': r.doi, 'PMID': r.pmid, 'URL': recordUrl(r), 'Sources': r.sources.join('; '),
+        'Year': r.year || '', 'Journal': r.journal, 'DOI': r.doi, 'PMID': r.pmid, 'Registry ID': r.registryId || '', 'URL': recordUrl(r), 'Sources': r.sources.join('; '),
         'Decision': d.status || '', 'Decided by': d.by || '', 'Decision reason': (d.reasons || []).join(' | '),
       };
       EXTRACT_FIELDS.forEach(([k, label]) => {
@@ -609,7 +799,7 @@
     });
   }
   function evidenceHeaders() {
-    const h = ['Record ID', 'Title', 'Authors', 'Year', 'Journal', 'DOI', 'PMID', 'URL', 'Sources', 'Decision', 'Decided by', 'Decision reason'];
+    const h = ['Record ID', 'Title', 'Authors', 'Year', 'Journal', 'DOI', 'PMID', 'Registry ID', 'URL', 'Sources', 'Decision', 'Decided by', 'Decision reason'];
     EXTRACT_FIELDS.forEach(([, label]) => h.push(label, label + ' — source passage'));
     return h.concat(['Verification', 'Retracted']);
   }
@@ -632,6 +822,7 @@
       if (r.pages) { const [sp, ep] = String(r.pages).split(/[-–]/); L.push('SP  - ' + sp); if (ep) L.push('EP  - ' + ep); }
       if (r.doi) L.push('DO  - ' + r.doi);
       if (r.pmid) L.push('AN  - PMID:' + r.pmid);
+      if (r.registryId) L.push('AN  - ' + r.registryId);
       if (r.abstract) L.push('AB  - ' + r.abstract);
       r.keywords.slice(0, 15).forEach((k) => L.push('KW  - ' + k));
       const u = recordUrl(r); if (u) L.push('UR  - ' + u);
@@ -851,7 +1042,8 @@
   const api = {
     VERSION, normDoi, normTitle, titleSimilarity, sentences, termRegex, findTerm, parseTerms, stripTags,
     makeRecord, recordKey, recordUrl, searchPubMed, searchEuropePMC, searchOpenAlex, parsePubMedXml,
-    fromEuropePMC, fromOpenAlex, invertedToText, ADAPTERS, dedupe, DEFAULT_CRITERIA, screen, extract, EXTRACT_FIELDS,
+    fromEuropePMC, fromOpenAlex, invertedToText, ADAPTERS, searchCrossref, searchSemanticScholar, searchClinicalTrials, searchDOAJ,
+    fromCrossref, fromSemanticScholar, fromClinicalTrial, fromDOAJ, stripFieldTags, toPlainQuery, toS2Query, toDoajQuery, dedupe, DEFAULT_CRITERIA, screen, extract, EXTRACT_FIELDS,
     NOT_REPORTED, fetchCrossref, verify, gapAnalysis, toCSV, evidenceRows, evidenceHeaders, toRIS, toBibTeX, toJSONL,
     flowCounts, newRecordsSince, parseRIS, parseMedline, parseBibTeX, parseDelimited, detectFormat, importText,
   };

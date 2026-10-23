@@ -159,6 +159,10 @@
   const SOURCES = [
     ['pubmed', 'PubMed', 'NCBI E-utilities. No key needed; a free NCBI key raises the rate limit.'],
     ['europepmc', 'Europe PMC', 'Includes PubMed plus preprints and other sources. No key needed.'],
+    ['crossref', 'Crossref', 'Metadata for nearly every DOI, all subjects. No key needed. Matches words by relevance; AND/OR/NOT are ignored.'],
+    ['semanticscholar', 'Semantic Scholar', 'AI-indexed papers across all sciences. No key needed; a free key avoids slowdowns at busy times.'],
+    ['doaj', 'DOAJ', 'Directory of Open Access Journals: open-access articles only. No key needed.'],
+    ['clinicaltrials', 'ClinicalTrials.gov', 'Trial registrations, including unpublished and ongoing trials. No key needed.'],
     ['openalex', 'OpenAlex', 'Broad coverage across disciplines. Needs a free API key from openalex.org/settings/api.'],
   ];
   function adapterOpts(src, base) {
@@ -166,6 +170,8 @@
     const o = Object.assign({}, base);
     if (src === 'pubmed') { o.apiKey = s.ncbiKey; o.email = s.email; }
     if (src === 'openalex') o.apiKey = s.openalexKey;
+    if (src === 'crossref') o.email = s.email;
+    if (src === 'semanticscholar') o.apiKey = s.s2Key;
     return o;
   }
   function friendlyError(src, e) {
@@ -249,7 +255,7 @@
           <small>Use AND, OR, NOT, brackets and "quoted phrases". The same string is sent to each database; PubMed also accepts field tags such as [tiab] and [mh].</small></label>
         <div class="grid2">
           <div class="field"><span>Databases</span><div class="checks">${SOURCES.map(([k, l, d]) => `<label title="${esc(d)}"><input type="checkbox" name="src" value="${k}" ${P.lastSources.includes(k) ? 'checked' : ''}> ${l}</label>`).join('')}</div>
-            <small>${!s.openalexKey ? 'OpenAlex needs a free API key (add it in Settings below).' : 'API keys saved in this browser.'}</small></div>
+            <small>All free. Hover a name for what it covers. ClinicalTrials.gov adds trial registrations, not papers.${!s.openalexKey ? ' OpenAlex needs a free key (Settings below).' : ''}</small></div>
           <div class="grid2" style="grid-template-columns:repeat(3,minmax(0,1fr))">
             <label class="field"><span>Max per database</span><input id="max" type="number" min="10" max="2000" step="10" value="${P.lastMax || 100}"></label>
             <label class="field"><span>Year from</span><input id="yf" type="number" min="1800" max="2100" value="${esc(P.criteria.yearFrom)}"></label>
@@ -272,7 +278,10 @@
           <label class="field"><span>Your email (sent to NCBI as contact)</span><input id="email" type="email" value="${esc(s.email)}"></label>
           <label class="field"><span>NCBI API key (optional)</span><input id="ncbi" type="password" autocomplete="off" value="${esc(s.ncbiKey)}"></label>
           <label class="field"><span>OpenAlex API key</span><input id="oakey" type="password" autocomplete="off" value="${esc(s.openalexKey)}"></label>
+          <label class="field"><span>Semantic Scholar API key (optional)</span><input id="s2key" type="password" autocomplete="off" value="${esc(s.s2Key || '')}"></label>
         </div>
+        <div class="bar"><button class="btn" type="button" id="testConn">Test connections</button><span class="muted">Checks each database from this browser with a one-record search.</span></div>
+        <div class="status" id="connStatus" aria-live="polite"></div>
         <small class="muted">Keys stay in this browser's storage and are sent only to the database they belong to. Search URLs in the log hide them.</small>
         <small class="muted" id="storageInfo"></small>
       </details>
@@ -281,7 +290,7 @@
       P.question = $('#question').value; P.lastQuery = $('#query').value;
       P.criteria.yearFrom = $('#yf').value; P.criteria.yearTo = $('#yt').value; P.lastMax = Number($('#max').value) || 100;
       P.lastSources = Array.from(el.querySelectorAll('input[name=src]:checked')).map((x) => x.value);
-      s.email = $('#email').value.trim(); s.ncbiKey = $('#ncbi').value.trim(); s.openalexKey = $('#oakey').value.trim();
+      s.email = $('#email').value.trim(); s.ncbiKey = $('#ncbi').value.trim(); s.openalexKey = $('#oakey').value.trim(); s.s2Key = $('#s2key').value.trim();
       save();
     };
     el.querySelectorAll('input,textarea').forEach((i) => i.addEventListener('change', sv));
@@ -292,6 +301,21 @@
     dz.addEventListener('dragleave', () => { dz.style.borderColor = ''; });
     dz.addEventListener('drop', (e) => { e.preventDefault(); dz.style.borderColor = ''; importFiles(Array.from(e.dataTransfer.files || [])); });
     showStorage();
+    $('#testConn').onclick = async (ev) => {
+      sv(); ev.target.disabled = true;
+      const out = $('#connStatus');
+      const lines = SOURCES.map(([, l]) => l + ': checking…'); out.textContent = lines.join('\n');
+      await Promise.all(SOURCES.map(async ([k, l], i) => {
+        if (k === 'openalex' && !store.settings.openalexKey) { lines[i] = l + ': skipped (add your free key first)'; out.textContent = lines.join('\n'); return; }
+        const t0 = performance.now();
+        try {
+          const res = await C.ADAPTERS[k](adapterOpts(k, { query: 'aspirin', max: 1 }));
+          lines[i] = '✓ ' + l + ': working (' + res.total.toLocaleString() + ' hits for "aspirin", ' + Math.round(performance.now() - t0) + ' ms)';
+        } catch (e) { lines[i] = '✗ ' + l + ': ' + friendlyError(l, e); }
+        out.textContent = lines.join('\n');
+      }));
+      ev.target.disabled = false;
+    };
     $('#run').onclick = async (ev) => {
       sv();
       const q = P.lastQuery.trim();
@@ -305,8 +329,9 @@
       $('#status').textContent = report + (n ? '\n\nDone. ' + n + ' new records were added and screened by your rules. Go to Screen to check them.' : '\n\nNo new records were added.');
     };
   }
-  async function importFiles(files) {
-    const st = $('#impStatus'); const lines = [];
+  async function importFiles(files, statusId) {
+    statusId = statusId || 'impStatus';
+    const st = document.getElementById(statusId); const lines = [];
     for (const f of files) {
       try {
         const text = await f.text();
@@ -322,7 +347,7 @@
       if (st) st.textContent = lines.join('\n');
     }
     await save(); render();
-    if ($('#impStatus')) $('#impStatus').textContent = lines.join('\n');
+    const st2 = document.getElementById(statusId); if (st2) st2.textContent = lines.join('\n');
   }
   async function showStorage() {
     const el = $('#storageInfo'); if (!el) return;
@@ -518,11 +543,13 @@
   }
 
   // ---- Gaps
+  let gapScope = 'included';
   function viewGaps(el) {
-    let set = included(); let basis = 'included';
-    if (!set.length) { set = recordsList(); basis = 'all screened'; }
+    const inc = included();
+    let set = gapScope === 'all' || !inc.length ? recordsList() : inc;
+    const basis = set === inc ? 'included' : 'all';
     const ex = {}; set.forEach((r) => { ex[r.id] = P.extractions[r.id] || C.extract(r); });
-    const g = C.gapAnalysis(set, ex);
+    const g = C.gapAnalysis(set, ex, basis === 'all' ? 'project' : 'included');
     const designs = Object.entries(g.design).sort((a, b) => b[1] - a[1]);
     const maxD = Math.max(1, ...designs.map((d) => d[1]));
     const years = Object.keys(g.year).map(Number).sort((a, b) => a - b);
@@ -531,7 +558,20 @@
     const titleOf = (id) => P.records[id] ? P.records[id].title : id;
     el.innerHTML = `
       <div class="head"><h2>Map the evidence</h2>
-        <p>Counts and patterns across the ${basis} records (${g.total}). These are leads for where evidence is thin or conflicting, not proven gaps. Check each one against the full texts.</p></div>
+        <p>Counts and patterns across ${basis === 'all' ? 'every record in the project' : 'the included records'} (${g.total.toLocaleString()}). These are leads for where evidence is thin or conflicting, not proven gaps. Check each one against the full texts.</p></div>
+      <section class="panel">
+        <div class="bar">
+          <span class="lbl">Analyse</span>
+          <div class="checks" role="radiogroup" aria-label="Records to analyse">
+            <label><input type="radio" name="gscope" value="included" ${basis === 'included' ? 'checked' : ''} ${inc.length ? '' : 'disabled'}> Included only (${inc.length.toLocaleString()})</label>
+            <label><input type="radio" name="gscope" value="all" ${basis === 'all' ? 'checked' : ''}> All records (${P.order.length.toLocaleString()})</label>
+          </div>
+          <span style="flex:1"></span>
+          <label class="btn" for="gapFile">Import files</label><input id="gapFile" type="file" multiple accept=".ris,.nbib,.txt,.bib,.bibtex,.csv,.tsv" hidden>
+        </div>
+        <small class="muted">To map a set of papers without screening them, import your export file (RIS, BibTeX, PubMed, CSV) and choose All records. Imported papers join this project and appear on the other stages too.</small>
+        <div class="status" id="gapImpStatus" aria-live="polite"></div>
+      </section>
       ${g.total ? `
       <section class="panel"><h3>What stands out</h3><ul class="reasons" style="font-size:.92rem">${g.notes.map((n) => '<li>' + esc(n) + '</li>').join('') || '<li>Nothing unusual found.</li>'}</ul></section>
       <div class="grid2">
@@ -541,7 +581,10 @@
       <section class="panel"><h3>Most frequent keywords</h3><div class="chips">${g.topKeywords.map(([k, n]) => `<span class="chip">${esc(k)}<b>${n}</b></span>`).join('') || '<span class="muted">The sources gave no keywords.</span>'}</div></section>
       <section class="panel"><h3>Possible contradictions</h3><p class="muted" style="margin:0">Pairs that share at least two keywords but whose key findings point in opposite directions.</p>
         ${g.contradictions.length ? '<div class="recs">' + g.contradictions.map((c) => `<div class="rec review"><div class="meta"><span>Shared: ${esc(c.shared.join(', '))}</span></div>
-          <div><b>${esc(titleOf(c.a))}</b><br><span class="muted">${esc(c.aFinding)}</span></div><div><b>${esc(titleOf(c.b))}</b><br><span class="muted">${esc(c.bFinding)}</span></div></div>`).join('') + '</div>' : '<p class="muted">None found.</p>'}</section>` : '<p class="muted">No records yet.</p>'}`;
+          <div><b>${esc(titleOf(c.a))}</b><br><span class="muted">${esc(c.aFinding)}</span></div><div><b>${esc(titleOf(c.b))}</b><br><span class="muted">${esc(c.bFinding)}</span></div></div>`).join('') + '</div>' : '<p class="muted">None found.</p>'}</section>` : '<p class="muted">No records yet. Run a search or import a file to see the evidence map.</p>'}`;
+    el.querySelectorAll('input[name=gscope]').forEach((r) => r.onchange = () => { gapScope = r.value; render(); });
+    const gf = $('#gapFile');
+    gf.onchange = async () => { const files = Array.from(gf.files); gf.value = ''; if (!files.length) return; gapScope = 'all'; await importFiles(files, 'gapImpStatus'); };
   }
 
   // ---- Watch
@@ -550,7 +593,7 @@
     const searches = uniqueSearches();
     const since = P.watch.lastRun ? P.watch.lastRun.slice(0, 10) : (P.searches[0] ? P.searches[0].at.slice(0, 10) : today());
     const newRecs = P.newIds.map((id) => P.records[id]).filter(Boolean);
-    const cfg = { project: P.name, email: store.settings.email || 'you@example.com', searches: searches.filter((s) => s.sourceKey !== 'openalex' && s.sourceKey !== 'sample').map((s) => ({ source: s.sourceKey, query: s.query })) };
+    const cfg = { project: P.name, email: store.settings.email || 'you@example.com', searches: searches.filter((s) => !['openalex', 'sample', 'file'].includes(s.sourceKey)).map((s) => ({ source: s.sourceKey, query: s.query })) };
     el.innerHTML = `
       <div class="head"><h2>Watch for new papers</h2>
         <p>Re-run this project's searches for records added since the last check. New records are de-duplicated, screened by your rules and tagged <span class="pill new">new</span> until you mark them seen.</p></div>
@@ -563,7 +606,8 @@
       ${newRecs.length ? '<section class="panel"><h3>New since you last looked</h3><div class="recs">' + newRecs.map(recCard).join('') + '</div></section>' : ''}
       ${runs.length ? '<section class="panel"><h3>Previous checks</h3><div class="tablewrap"><table><thead><tr><th>When</th><th>Since</th><th>New records</th></tr></thead><tbody>' + runs.slice().reverse().map((r) => `<tr><td>${esc(fmtDate(r.at))}</td><td>${esc(r.since)}</td><td class="num">${r.found}</td></tr>`).join('') + '</tbody></table></div></section>' : ''}
       <section class="panel"><h3>Run it every week without opening the app</h3>
-        <p style="margin:0">The repository includes a GitHub Actions job that runs every Monday at 09:00 IST, checks PubMed and Europe PMC for these searches and commits a Markdown digest to <code>reports/</code>. Paste this into <code>watch/searches.json</code> in your repository:</p>
+        <p style="margin:0">The repository includes a GitHub Actions job that runs every Monday at 09:00 IST, checks PubMed and Europe PMC for these searches and saves a Markdown digest. It stays switched off until you give it searches.</p>
+        <div class="note warn"><b>Keep your topics private.</b> Anything in a public GitHub repository, including its reports and issues, can be read by anyone. Use a <b>private</b> copy of the repository, or paste this into a repository secret named <code>LITINTEL_SEARCHES</code> instead of into <code>watch/searches.json</code>. The Check button above is always private: it runs only in your browser.</div>
         <pre class="code" id="cfg">${esc(JSON.stringify(cfg, null, 2))}</pre>
         <div class="bar"><button class="btn sm" type="button" id="copyCfg">Copy</button></div></section>`;
     if ($('#wSeen')) $('#wSeen').onclick = () => { P.newIds = []; save(); render(); };
@@ -576,7 +620,7 @@
       ev.target.disabled = true;
       let total = 0;
       for (const s of searches) {
-        if (s.sourceKey === 'sample') continue;
+        if (s.sourceKey === 'sample' || s.sourceKey === 'file' || !C.ADAPTERS[s.sourceKey]) continue;
         total += await runSearch([s.sourceKey], s.query, { since, max: 500 }, $('#wstatus'));
       }
       const failed = P.searches.slice(-searches.length).every((s) => s.error);

@@ -1,6 +1,6 @@
 // LitIntel service worker: keeps the app itself available offline.
 // Database and Crossref requests always go to the network and are never cached.
-const CACHE = 'litintel-v0.2.0';
+const CACHE = 'litintel-v0.3.0';
 const SHELL = ['./', 'index.html', 'core.js', 'app.js', 'sample.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {

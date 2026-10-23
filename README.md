@@ -1,6 +1,6 @@
 # LitIntel
 
-LitIntel searches PubMed, Europe PMC and OpenAlex, removes duplicate records, screens titles and abstracts against your eligibility rules, extracts study details, and checks every included record against its Crossref registry entry. Each decision keeps its reason, and each extracted value keeps the sentence it came from, so the whole review can be audited and repeated.
+LitIntel searches seven free databases (PubMed, Europe PMC, Crossref, Semantic Scholar, DOAJ, ClinicalTrials.gov and OpenAlex), removes duplicate records, screens titles and abstracts against your eligibility rules, extracts study details, and checks every included record against its Crossref registry entry. Each decision keeps its reason, and each extracted value keeps the sentence it came from, so the whole review can be audited and repeated.
 
 It runs entirely in the browser. There is no server, no account and no paid API. A weekly GitHub Actions job watches your searches for new papers and opens an issue when something appears.
 
@@ -29,7 +29,7 @@ Created by **Khan Gulrez Shagufa Fazal Ahmed** ([ORCID 0009-0009-6195-0329](http
 | 2. Screen | Rules mark each record include, exclude or review, and write down why (the matched term and the passage it was found in). You confirm or overrule. | The rule's reason and your own, side by side |
 | 3. Extract | Pattern rules pull study design, sample size, population, intervention, outcomes, key finding and limitations from the abstract. Anything not found is marked "Not reported in abstract". | The source sentence for every value; click to correct |
 | 4. Verify | Each included record is checked against Crossref (title, year, first author, retractions, corrections) and against the project's rules. | Pass, warning or fail per check |
-| 5. Gaps | Counts by study design, year and keyword, plus pairs of studies whose findings point in opposite directions. | Leads to follow up, not conclusions |
+| 5. Gaps | Counts by study design, year and keyword, plus pairs of studies whose findings point in opposite directions. Analyse the included records or every record; import files here to map a set of papers without screening them. | Leads to follow up, not conclusions |
 | 6. Watch | Re-runs the searches for records added since the last check, in the app or weekly on GitHub. | A dated digest of new records |
 | 7. Export & log | Evidence table (CSV), citations (RIS, BibTeX), a Markdown report with the search log and flow counts, the project file (JSON), and the error log (JSONL). | Everything needed to write the methods section |
 
@@ -40,6 +40,20 @@ A record passes when it has a DOI or PMID, its DOI resolves at Crossref with a m
 ### The error log
 
 Every time you overrule a screening decision or correct an extracted value, LitIntel saves the input, what the rules produced, your correction, and an error category. Export it from **Export & log** as JSONL. It shows where the rules go wrong and can later serve as training or evaluation data.
+
+## Databases
+
+| Database | What it covers | Key | Search syntax |
+|---|---|---|---|
+| PubMed | Biomedical literature (MEDLINE) | None; optional free NCBI key | Full Boolean, field tags such as `[tiab]`, `[mh]` |
+| Europe PMC | PubMed plus preprints (bioRxiv, medRxiv), patents, agricultural and other sources | None | Boolean |
+| Crossref | Metadata for nearly every DOI, all subjects | None | Relevance on words; AND/OR/NOT are ignored |
+| Semantic Scholar | Papers across all sciences, with AI-extracted metadata | None; optional free key | Boolean (translated automatically) |
+| DOAJ | Open-access journal articles only | None | Boolean; `*` wildcards are removed |
+| ClinicalTrials.gov | Trial registrations, including unpublished and ongoing trials | None | Boolean |
+| OpenAlex | Broad catalogue across disciplines | Free key per user | Relevance |
+
+PubMed field tags are removed automatically before a search goes to the other databases, so one search string works everywhere. ClinicalTrials.gov returns registrations, not papers: each one keeps its NCT number, is screened and extracted like a paper (enrollment, phase, design), and is never merged with a publication of the same title. **Search → Settings → Test connections** checks every database from your own browser.
 
 ## Importing from other databases
 
@@ -76,35 +90,50 @@ npx serve .          # or: python3 -m http.server 8000
 
 Then open the address it prints. Click **Load the example project** to see a finished review built on eight fictional records (their DOIs use the reserved 10.5555 test prefix).
 
-## Deploy on Cloudflare Pages (free)
+## Deploy on Cloudflare (free)
 
 1. Push this folder to a new public GitHub repository, for example `randomthingsonlineatsk-cloud/litintel`.
-2. In the Cloudflare dashboard go to **Workers & Pages → Create → Pages → Connect to Git** and pick the repository.
-3. Set **Framework preset** to *None*, leave **Build command** empty and set **Build output directory** to `/`.
+2. In the Cloudflare dashboard go to **Workers & Pages → Create** and import the repository.
+3. Leave **Build command** empty. The deploy command `npx wrangler deploy` is fine as it is.
 4. Deploy. Every push to `main` redeploys the site.
+
+`wrangler.jsonc` tells Cloudflare the site is plain static files, and `.assetsignore` keeps everything that is not part of the website (tests, the watch script, `node_modules`) from being uploaded. Keep both files in the repository; without `.assetsignore` the deploy fails with "Asset too large".
 
 Netlify and GitHub Pages work the same way, since the app is plain HTML, CSS and JavaScript.
 
-## Weekly watch on GitHub Actions
+## Weekly watch on GitHub Actions (optional)
 
-1. Edit `watch/searches.json`. Copy the ready-made version from the app's **Watch** stage, or write it by hand:
+The job in `.github/workflows/weekly-watch.yml` runs every Monday at 09:00 IST. **It does nothing until you give it searches**, and `watch/searches.json` ships empty.
 
-   ```json
-   {
-     "project": "Nanocarriers in cancer",
-     "email": "you@example.org",
-     "searches": [
-       { "source": "pubmed", "query": "(liposom*[tiab] OR nanoparticle*[tiab]) AND neoplasms[mh]" },
-       { "source": "europepmc", "query": "(liposom* OR nanoparticle*) AND (cancer OR tumour)" }
-     ]
-   }
-   ```
+**Privacy first.** In a public repository, everything the job saves (the search file, the reports in `reports/` and the issues it opens) can be read by anyone. If your topics are confidential, do one of these:
 
-2. Optional: add an `NCBI_API_KEY` secret under **Settings → Secrets and variables → Actions**.
-3. Under **Settings → Actions → General → Workflow permissions**, choose **Read and write permissions**.
-4. The job in `.github/workflows/weekly-watch.yml` runs every Monday at 09:00 IST. Start it by hand from the **Actions** tab to test it.
+- **Private repository (simplest):** create a separate private repository, upload this project to it, and set up the watch there. GitHub Actions on private repositories is free up to 2,000 minutes a month; one weekly run takes about one minute.
+- **Secret in the public repository:** leave `watch/searches.json` empty and put your searches in a repository secret named `LITINTEL_SEARCHES` (**Settings → Secrets and variables → Actions → New repository secret**). The secret itself stays hidden, but the reports and issues the job creates are still public, so this hides your queries, not your results.
+
+The format, in the file or the secret:
+
+```json
+{
+  "project": "My watch",
+  "email": "",
+  "searches": [
+    { "source": "pubmed", "query": "your PubMed search" },
+    { "source": "europepmc", "query": "your Europe PMC search" }
+  ]
+}
+```
+
+`source` can be `pubmed`, `europepmc`, `crossref`, `semanticscholar`, `doaj`, `clinicaltrials` or `openalex` (OpenAlex needs an `OPENALEX_API_KEY` secret).
+
+The app's **Watch** stage builds this for you from a project's searches. Then:
+
+1. Optional: add an `NCBI_API_KEY` secret for higher PubMed rate limits.
+2. Under **Settings → Actions → General → Workflow permissions**, choose **Read and write permissions**.
+3. Start it by hand from the **Actions** tab to test it.
 
 Each run writes `reports/YYYY-MM-DD.md`, remembers what it has reported in `watch/state.json`, and opens a GitHub issue when there are new records, so GitHub emails you.
+
+**The in-app Watch is always private.** The **Check for records added since…** button in the app runs only in your browser and saves nothing outside it.
 
 ## Develop
 
