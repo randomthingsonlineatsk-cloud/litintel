@@ -1,8 +1,5 @@
 {
-  "project": "My literature watch",
-  "email": "you@example.com",
-  "searches": [
-    { "source": "pubmed", "query": "(liposom*[tiab] OR nanoparticle*[tiab]) AND (cancer[tiab] OR neoplasms[mh])" },
-    { "source": "europepmc", "query": "(liposom* OR nanoparticle*) AND (cancer OR tumour OR tumor)" }
-  ]
+  "project": "",
+  "email": "",
+  "searches": []
 }
