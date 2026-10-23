@@ -1,0 +1,23 @@
+{
+  "name": "litintel",
+  "version": "0.2.0",
+  "description": "Search, screen, extract and verify scientific literature with every decision traceable to its source.",
+  "main": "core.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node test/core.test.js && node test/import.test.js && node test/watch.test.mjs",
+    "watch": "node watch/run.mjs"
+  },
+  "author": "Khan Gulrez Shagufa Fazal Ahmed",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@xmldom/xmldom": "^0.9.12"
+  },
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/randomthingsonlineatsk-cloud/litintel"
+  }
+}
